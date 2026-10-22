@@ -1,0 +1,96 @@
+#include <bits/stdc++.h>
+#include <fcntl.h>
+#include <unistd.h>
+using namespace std;
+
+// Locks byte ranges: many readers OR one writer per overlapping range
+class RangeLock {
+    struct Range {
+        long start, end;       // [start, end)
+        bool write;
+        int id;
+    };
+    vector<Range> active;
+    mutex m;
+    condition_variable changed;
+    int nextId = 0;
+
+    bool conflicts(long start, long end, bool write) {
+        for (Range& r : active) {
+            bool overlap = start < r.end && r.start < end;
+            if (overlap && (write || r.write)) return true;   // read+read is fine
+        }
+        return false;
+    }
+
+public:
+    int lock(long start, long end, bool write) {
+        unique_lock<mutex> lk(m);
+        while (conflicts(start, end, write)) {
+            changed.wait(lk);
+        }
+        int id = nextId++;
+        active.push_back({start, end, write, id});
+        return id;
+    }
+
+    void unlock(int id) {
+        {
+            lock_guard<mutex> lk(m);
+            for (int i = 0; i < active.size(); i++) {
+                if (active[i].id == id) {
+                    active.erase(active.begin() + i);
+                    break;
+                }
+            }
+        }
+        changed.notify_all();   // waiters want different ranges, so wake all to re-check
+    }
+};
+
+class OffsetFile {
+    int fd;
+    RangeLock ranges;
+
+public:
+    OffsetFile(string path) {
+        fd = open(path.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd < 0) throw runtime_error("cannot open file");
+    }
+
+    ~OffsetFile() {
+        close(fd);
+    }
+
+    void write(long offset, string data) {
+        int id = ranges.lock(offset, offset + data.size(), true);
+        pwrite(fd, data.data(), data.size(), offset);       // no shared cursor
+        ranges.unlock(id);
+    }
+
+    string read(long offset, int len) {
+        int id = ranges.lock(offset, offset + len, false);
+        string buf(len, '\0');
+        ssize_t n = pread(fd, &buf[0], len, offset);        // no shared cursor
+        ranges.unlock(id);
+        buf.resize(n > 0 ? n : 0);                          // fewer bytes near end of file
+        return buf;
+    }
+};
+
+// ---------- demo ----------
+OffsetFile f("data.bin");
+
+void writer(long offset, string text) {
+    f.write(offset, text);
+}
+
+int main() {
+    thread t1(writer, 0, string("AAAA"));    // bytes 0-3
+    thread t2(writer, 4, string("BBBB"));    // bytes 4-7, no overlap, runs in parallel
+    t1.join();
+    t2.join();
+
+    cout << f.read(0, 8) << endl;            // AAAABBBB
+    cout << f.read(2, 4) << endl;            // AABB
+}
