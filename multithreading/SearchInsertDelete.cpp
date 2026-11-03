@@ -1,4 +1,9 @@
-#include <bits/stdc++.h>
+#include <iostream>
+#include <string>
+#include <condition_variable>
+#include <thread>
+#include<vector>
+
 using namespace std;
 
 class SearchInsertDelete {
@@ -19,11 +24,6 @@ class SearchInsertDelete {
     bool deleting = false;                // a delete running now
     int waitingDeleters = 0;              // deletes waiting for their turn
 
-    void startSearch() {
-        unique_lock<mutex> lock(m);
-        while (deleting || waitingDeleters > 0) changed.wait(lock);
-        searchers++;
-    }
     void endSearch() {
         bool last;
         {
@@ -54,17 +54,14 @@ class SearchInsertDelete {
         waitingDeleters--;
         deleting = true;
     }
-    void endDelete() {
-        {
-            lock_guard<mutex> lock(m);
-            deleting = false;
-        }
-        changed.notify_all();
-    }
 
 public:
     bool search(int v) {
-        startSearch();
+       {
+        unique_lock<mutex> lock(m);
+        while (deleting || waitingDeleters > 0) changed.wait(lock);
+        searchers++;
+    }
         bool found = false;
         for (Node* cur = head.next.load(); cur != nullptr; cur = cur->next.load()) {
             if (cur->val == v) { found = true; break; }
@@ -94,7 +91,11 @@ public:
                 break;
             }
         }
-        endDelete();
+         {
+            lock_guard<mutex> lock(m);
+            deleting = false;
+        }
+        changed.notify_all();
         return removed;
     }
 };

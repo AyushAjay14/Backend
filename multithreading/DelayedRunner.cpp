@@ -1,4 +1,7 @@
-#include <bits/stdc++.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <iostream>
 using namespace std;
 
 class DelayedScheduler {
@@ -22,23 +25,20 @@ class DelayedScheduler {
     bool done = false;
     vector<thread> workers;
 
-    void worker() {
+   void worker() {
         unique_lock<mutex> lock(m);
-        while (!done) {
-            if (pq.empty()) {
-                cv.wait(lock);                    // nothing scheduled: sleep
-                continue;
+        while (true) {
+            // wait until: shutting down, OR there's a task AND it's due
+            while (!done && (pq.empty() || Clock::now() < pq.top().runAt)) {
+                if (pq.empty()) cv.wait(lock);
+                else cv.wait_until(lock, pq.top().runAt);   // deadline re-read every pass
             }
-            Clock::time_point next = pq.top().runAt;
-            if (Clock::now() < next) {
-                cv.wait_until(lock, next);        // sleep until earliest task is due
-                continue;                         // (or until a new earlier task arrives)
-            }
+            if (done) return;
 
             function<void()> task = pq.top().task;
             pq.pop();
 
-            lock.unlock();                        // run WITHOUT the lock
+            lock.unlock();
             try {
                 task();
             } catch (...) {

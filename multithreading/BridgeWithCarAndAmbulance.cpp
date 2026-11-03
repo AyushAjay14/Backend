@@ -51,7 +51,11 @@ Can cars starve because of ambulances? If ambulances keep arriving, cars never g
 Two ambulances from opposite sides? Both wait for an empty bridge. Whichever grabs the lock first goes, then the other.
 */
 
-#include <bits/stdc++.h>
+#include<condition_variable>
+#include<mutex>
+#include<thread>
+#include<iostream>
+
 using namespace std;
 
 class OneWayBridge {

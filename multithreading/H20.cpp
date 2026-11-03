@@ -1,3 +1,8 @@
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+using namespace std;
+
 class H2O {
     mutex mtx;
     condition_variable cvHydrogen;   // hydrogens waiting for room

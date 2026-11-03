@@ -1,3 +1,10 @@
+#include <iostream>
+#include <string>
+#include <condition_variable>
+#include <thread>
+
+using namespace std;
+
 class UnisexBathroom{
     mutex mtx;
     condition_variable cv_male, cv_female;

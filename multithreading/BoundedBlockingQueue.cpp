@@ -1,9 +1,16 @@
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <stdexcept>
+using namespace std;
+
+
 class BoundedBlockingQueue{
-    queue<int> q;
+    std::queue<int> q;
     int capacity;
     int maxCap;
-    condition_variable has_space , has_value;
-    mutex mtx;
+    std::condition_variable has_space, has_value;
+    std::mutex mtx;
 
     public:
     BoundedBlockingQueue(int cap){

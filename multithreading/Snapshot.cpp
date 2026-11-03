@@ -1,187 +1,112 @@
-#include <bits/stdc++.h>
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <map>
+#include <set>
+#include <vector>
+#include <string>
+#include <memory>
+#include <functional>
+#include <iterator>
+#include <future>
+#include <algorithm>
 using namespace std;
+namespace fs = std::filesystem;
 
-// ================= Thread pool with waitAll() =================
-class ThreadPool {
-    queue<function<void()>> q;
-    vector<thread> workers;
-    mutex m;
-    condition_variable hasJob, allDone;
-    int pending = 0;
-    bool done = false;
+enum class ChangeType { ADDED, MODIFIED, REMOVED };
 
-    void worker() {
-        while (true) {
-            function<void()> task;
-            {
-                unique_lock<mutex> lock(m);
-                while (q.empty() && !done) hasJob.wait(lock);
-                if (q.empty()) return;
-                task = move(q.front());
-                q.pop();
+struct Node {
+    string hash;
+    bool isDir = false;
+    map<string, unique_ptr<Node>> children;
+};
+
+class MerkleTree {
+    unique_ptr<Node> root;
+    static const int PARALLEL_DEPTH = 2;      // only the top 2 levels get their own threads
+
+    unique_ptr<Node> build(fs::path p, int depth) {
+        unique_ptr<Node> n(new Node());
+        hash<string> h;
+        if (fs::is_directory(p)) {
+            n->isDir = true;
+            vector<pair<string, future<unique_ptr<Node>>>> running;
+
+            for (auto& e : fs::directory_iterator(p)) {
+                string name = e.path().filename().string();
+                if (depth < PARALLEL_DEPTH) {
+                    // build this child on a new thread
+                    running.push_back({name, async(launch::async, &MerkleTree::build,
+                                                   this, e.path(), depth + 1)});
+                } else {
+                    n->children[name] = build(e.path(), depth + 1);   // deeper: same thread
+                }
             }
-            task();
-            bool last;
-            {
-                lock_guard<mutex> lock(m);
-                pending--;
-                last = (pending == 0);
-            }
-            if (last) allDone.notify_all();
+            for (auto& r : running) n->children[r.first] = r.second.get();   // wait for each
+
+            string combined;
+            for (auto& c : n->children) combined += c.second->hash;
+            n->hash = to_string(h(combined));
+        } else {
+            ifstream in(p, ios::binary);
+            string data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+            n->hash = to_string(h(data));
         }
+        return n;
+    }
+
+    void collect(Node* n, string path, ChangeType t, vector<pair<string, ChangeType>>& out) {
+        if (!n->isDir) { out.push_back({path, t}); return; }
+        for (auto& c : n->children) collect(c.second.get(), path + "/" + c.first, t, out);
+    }
+
+    Node* child(Node* n, const string& name) {
+        auto it = n->children.find(name);              // find: read-only, safe across threads
+        return it == n->children.end() ? nullptr : it->second.get();
+    }
+
+    // Returns its own result list, so threads never write to shared data
+    vector<pair<string, ChangeType>> compare(Node* a, Node* b, string path, int depth) {
+        vector<pair<string, ChangeType>> out;
+        if (a && b && a->hash == b->hash) return out;
+        if (!a) { collect(b, path, ChangeType::ADDED, out); return out; }
+        if (!b) { collect(a, path, ChangeType::REMOVED, out); return out; }
+        if (!a->isDir && !b->isDir) { out.push_back({path, ChangeType::MODIFIED}); return out; }
+        if (a->isDir != b->isDir) {
+            collect(a, path, ChangeType::REMOVED, out);
+            collect(b, path, ChangeType::ADDED, out);
+            return out;
+        }
+
+        set<string> names;
+        for (auto& c : a->children) names.insert(c.first);
+        for (auto& c : b->children) names.insert(c.first);
+
+        vector<future<vector<pair<string, ChangeType>>>> running;
+        for (auto& name : names) {
+            Node* ca = child(a, name);
+            Node* cb = child(b, name);
+            if (depth < PARALLEL_DEPTH) {
+                running.push_back(async(launch::async, &MerkleTree::compare,
+                                        this, ca, cb, path + "/" + name, depth + 1));
+            } else {
+                vector<pair<string, ChangeType>> sub = compare(ca, cb, path + "/" + name, depth + 1);
+                out.insert(out.end(), sub.begin(), sub.end());
+            }
+        }
+        for (auto& r : running) {                      // merge each thread's result
+            vector<pair<string, ChangeType>> sub = r.get();
+            out.insert(out.end(), sub.begin(), sub.end());
+        }
+        return out;
     }
 
 public:
-    ThreadPool(int n) {
-        for (int i = 0; i < n; i++) workers.emplace_back(&ThreadPool::worker, this);
-    }
-    void enqueue(function<void()> task) {
-        {
-            lock_guard<mutex> lock(m);
-            q.push(move(task));
-            pending++;
-        }
-        hasJob.notify_one();
-    }
-    void waitAll() {
-        unique_lock<mutex> lock(m);
-        while (pending > 0) allDone.wait(lock);
-    }
-    ~ThreadPool() {
-        {
-            lock_guard<mutex> lock(m);
-            done = true;
-        }
-        hasJob.notify_all();
-        for (auto& w : workers) w.join();
+    MerkleTree(const string& dir) : root(build(dir, 0)) {}
+
+    vector<pair<string, ChangeType>> diff(MerkleTree& other) {
+        vector<pair<string, ChangeType>> out = compare(root.get(), other.root.get(), "", 0);
+        sort(out.begin(), out.end());
+        return out;
     }
 };
-
-// ================= Merkle tree =================
-struct Node {
-    bool isDir = true;
-    string hash;
-    map<string, Node*> children;   // sorted, so folder hashes are consistent
-};
-
-// Add "/a/b/c.txt" with its file hash, creating folders on the way
-void insertFile(Node* root, string path, string fileHash) {
-    Node* cur = root;
-    string name;
-    for (int i = 1; i <= path.size(); i++) {
-        if (i == path.size() || path[i] == '/') {
-            if (!cur->children.count(name)) cur->children[name] = new Node();
-            cur = cur->children[name];
-            name = "";
-        } else {
-            name += path[i];
-        }
-    }
-    cur->isDir = false;
-    cur->hash = fileHash;
-}
-
-// Bottom-up: a folder's hash comes from its children's names + hashes
-void computeHash(Node* node) {
-    if (!node->isDir) return;
-    string combined;
-    for (auto& c : node->children) {
-        computeHash(c.second);
-        combined += c.first + ":" + c.second->hash + ";";
-    }
-    hash<string> h;
-    node->hash = to_string(h(combined));
-}
-
-// ================= Results =================
-mutex resultMtx;
-vector<string> added, deleted, modified;
-atomic<int> foldersCompared(0);
-
-string fullPath(string parent, string name, Node* n) {
-    return parent + name + (n->isDir ? "/" : "");
-}
-
-// Add a node and everything below it to a list
-void collectAll(Node* node, string path, vector<string>& out) {
-    out.push_back(path);
-    for (auto& c : node->children) {
-        collectAll(c.second, fullPath(path, c.first, c.second), out);
-    }
-}
-
-// Compare two folders whose hashes differ
-void compare(Node* a, Node* b, string path, ThreadPool* pool) {
-    foldersCompared++;
-    vector<string> add, del, mod;
-
-    for (auto& c : a->children) {
-        Node* oldChild = c.second;
-        string p = fullPath(path, c.first, oldChild);
-
-        if (!b->children.count(c.first)) {           // only in old
-            collectAll(oldChild, p, del);
-            continue;
-        }
-        Node* newChild = b->children[c.first];
-        if (oldChild->hash == newChild->hash) continue;   // identical: SKIP whole subtree
-
-        if (oldChild->isDir && newChild->isDir) {
-            mod.push_back(p);
-            pool->enqueue(bind(compare, oldChild, newChild, p, pool));   // dig in, in parallel
-        } else if (!oldChild->isDir && !newChild->isDir) {
-            mod.push_back(p);                         // file content changed
-        } else {                                      // file became folder, or the reverse
-            collectAll(oldChild, p, del);
-            collectAll(newChild, fullPath(path, c.first, newChild), add);
-        }
-    }
-
-    for (auto& c : b->children) {
-        if (!a->children.count(c.first)) {           // only in new
-            collectAll(c.second, fullPath(path, c.first, c.second), add);
-        }
-    }
-
-    lock_guard<mutex> lock(resultMtx);                // merge once per task
-    added.insert(added.end(), add.begin(), add.end());
-    deleted.insert(deleted.end(), del.begin(), del.end());
-    modified.insert(modified.end(), mod.begin(), mod.end());
-}
-
-void printList(string title, vector<string>& items) {
-    sort(items.begin(), items.end());
-    cout << title << endl;
-    if (items.empty()) cout << "  (none)" << endl;
-    for (string& s : items) cout << "  " << s << endl;
-}
-
-int main() {
-    Node* oldRoot = new Node();
-    insertFile(oldRoot, "/Downloads/resume.pdf",              "r1");
-    insertFile(oldRoot, "/Downloads/folder/file.txt",         "x1");
-    insertFile(oldRoot, "/Downloads/folder2/folder/file.txt", "y1");
-    insertFile(oldRoot, "/Downloads/photos/a.jpg",            "p1");
-    insertFile(oldRoot, "/Downloads/photos/b.jpg",            "p2");
-
-    Node* newRoot = new Node();
-    insertFile(newRoot, "/Downloads/resume.pdf",              "r1");   // same
-    insertFile(newRoot, "/Downloads/folder/file.txt",         "x2");   // changed
-    insertFile(newRoot, "/Downloads/file.txt",                "n1");   // added
-    insertFile(newRoot, "/Downloads/photos/a.jpg",            "p1");   // same
-    insertFile(newRoot, "/Downloads/photos/b.jpg",            "p2");   // same
-
-    computeHash(oldRoot);
-    computeHash(newRoot);
-
-    ThreadPool pool(4);
-    if (oldRoot->hash != newRoot->hash) {
-        pool.enqueue(bind(compare, oldRoot, newRoot, string("/"), &pool));
-    }
-    pool.waitAll();
-
-    printList("Added:", added);
-    printList("Deleted:", deleted);
-    printList("Modified:", modified);
-    cout << "Folders compared: " << foldersCompared << endl;
-}

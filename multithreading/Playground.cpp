@@ -1,3 +1,8 @@
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+using namespace std;
+
 class Playground{
     int currentTicket;
     int nowServing;
