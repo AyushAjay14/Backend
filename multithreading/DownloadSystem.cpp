@@ -266,3 +266,8 @@ int main() {
              << "  updated=" << f.lastUpdate << endl;
     }
 }
+
+/*
+Cross questions: how to reduce efficiency if large number of writer threads are there. Solution: use multiple files to add 
+Journal. And shard them using hash technique
+*/
